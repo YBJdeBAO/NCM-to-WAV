@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NCM 批量转换 WAV 工具</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        .drop-zone {
+            border: 2px dashed #cbd5e1;
+            transition: all 0.3s ease;
+        }
+        .drop-zone.dragging {
+            border-color: #3b82f6;
+            background-color: #eff6ff;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen p-4 md:p-8">
+    <div class="max-w-4xl mx-auto">
+        <div class="text-center mb-10">
+            <h1 class="text-3xl font-bold text-slate-800 mb-2">NCM 批量转 WAV 工具</h1>
+            <p class="text-slate-600">配置建议：请确保浏览器已允许本页面的“弹出式窗口”以实现连续下载</p>
+        </div>
+
+        <div id="dropZone" class="drop-zone bg-white rounded-xl p-10 text-center cursor-pointer mb-8">
+            <input type="file" id="fileInput" multiple accept=".ncm" class="hidden">
+            <div class="space-y-4">
+                <div class="flex justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 13h6m-3-3v6m-9 1V7a2 2 0 012-2h6l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
+                    </svg>
+                </div>
+                <div class="text-lg text-slate-700">拖拽 NCM 文件到此处</div>
+                <div class="flex flex-col items-center space-y-2">
+                    <span class="text-sm text-slate-500 bg-green-50 text-green-700 py-2 px-4 rounded-full border border-green-100 font-medium">
+                        状态：已启用 40 首分卷打包逻辑
+                    </span>
+                </div>
+            </div>
+        </div>
+
+        <div id="taskList" class="space-y-3 hidden">
+            <div class="flex justify-between items-center mb-4">
+                <div class="flex items-center space-x-4">
+                    <h2 class="text-xl font-semibold text-slate-800">转换列表</h2>
+                    <span id="progressCount" class="text-sm text-slate-500"></span>
+                </div>
+                <div class="flex space-x-2" id="globalActions">
+                    <button id="clearBtn" class="text-sm text-red-500 hover:text-red-700 px-3 py-1 rounded border border-red-200">清空列表</button>
+                </div>
+            </div>
+            <div id="itemsContainer" class="space-y-3"></div>
+        </div>
+    </div>
+
+    <script>
+        const CORE_KEY = CryptoJS.enc.Hex.parse("687a4852416d736f356b496e62617857");
+        const CHUNK_SIZE = 40; 
+
+        const fileInput = document.getElementById('fileInput');
+        const dropZone = document.getElementById('dropZone');
+        const taskList = document.getElementById('taskList');
+        const itemsContainer = document.getElementById('itemsContainer');
+        const clearBtn = document.getElementById('clearBtn');
+        const progressCount = document.getElementById('progressCount');
+        const globalActions = document.getElementById('globalActions');
+
+        let totalFiles = 0;
+        let finishedCount = 0;
+        let partCounter = 1;
+        let isProcessing = false;
+        let fileQueue = []; 
+        let currentChunkFiles = []; 
+        let downloadQueue = [];
+
+        // --- NCM 解密算法 ---
+        async function decryptNcm(buffer) {
+            const view = new DataView(buffer);
+            let offset = 0;
+            if (view.getUint32(0, true) !== 0x4e455443) throw new Error("无效 NCM");
+            offset += 10;
+            
+            const keyLen = view.getUint32(offset, true);
+            offset += 4;
+            const keyData = new Uint8Array(buffer.slice(offset, offset + keyLen)).map(b => b ^ 0x64);
+            offset += keyLen;
+            
+            const keyDataHex = Array.from(keyData).map(b => b.toString(16).padStart(2, '0')).join('');
+            const decryptedKey = CryptoJS.AES.decrypt(
+                { ciphertext: CryptoJS.enc.Hex.parse(keyDataHex) }, 
+                CORE_KEY, 
+                { mode: CryptoJS.mode.ECB, padding: CryptoJS.pad.Pkcs7 }
+            ).toString(CryptoJS.enc.Utf8).slice(17);
+            
+            const keyBox = new Uint8Array(decryptedKey.split('').map(c => c.charCodeAt(0)));
+            const sBox = new Uint8Array(256).map((_, i) => i);
+            let j = 0;
+            for (let i = 0; i < 256; i++) {
+                j = (j + sBox[i] + keyBox[i % keyBox.length]) & 0xff;
+                [sBox[i], sBox[j]] = [sBox[j], sBox[i]];
+            }
+            
+            const metaLen = view.getUint32(offset, true);
+            offset += 4 + metaLen + 5 + 4;
+            const crcLen = view.getUint32(offset, true);
+            offset += 4 + crcLen;
+            
+            const audioData = new Uint8Array(buffer.slice(offset));
+            const finalData = new Uint8Array(audioData.length);
+            for (let i = 0; i < audioData.length; i++) {
+                const boxI = (i + 1) & 0xff;
+                const si = sBox[boxI];
+                const sj = sBox[(boxI + si) & 0xff];
+                finalData[i] = audioData[i] ^ sBox[(si + sj) & 0xff];
+            }
+            return finalData.buffer;
+        }
+
+        // --- WAV 封装 ---
+        function audioBufferToWav(buffer) {
+            const numOfChan = buffer.numberOfChannels;
+            const length = buffer.length * numOfChan * 2 + 44;
+            const outBuffer = new ArrayBuffer(length);
+            const view = new DataView(outBuffer);
+            const channels = [];
+            let i, sample, offset = 0, pos = 0;
+
+            const setUint16 = (data) => { view.setUint16(pos, data, true); pos += 2; };
+            const setUint32 = (data) => { view.setUint32(pos, data, true); pos += 4; };
+
+            setUint32(0x46464952); setUint32(length - 8); setUint32(0x45564157); 
+            setUint32(0x20746d66); setUint32(16); setUint16(1); setUint16(numOfChan);
+            setUint32(buffer.sampleRate); setUint32(buffer.sampleRate * 2 * numOfChan);
+            setUint16(numOfChan * 2); setUint16(16); setUint32(0x61746164); setUint32(length - 44);
+
+            for(i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
+            while(pos < length) {
+                for(i = 0; i < numOfChan; i++) {
+                    sample = Math.max(-1, Math.min(1, channels[i][offset]));
+                    sample = (sample < 0 ? sample * 0x8000 : sample * 0x7FFF);
+                    view.setInt16(pos, sample, true); pos += 2;
+                }
+                offset++;
+            }
+            return outBuffer;
+        }
+
+        async function robustDecodeAudio(ctx, rawBuffer) {
+            try { return await ctx.decodeAudioData(rawBuffer); } catch (e) {
+                const uint8 = new Uint8Array(rawBuffer);
+                for (let i = 0; i < Math.min(uint8.length, 10240); i++) {
+                    if ((uint8[i] === 0xFF && (uint8[i+1] & 0xE0) === 0xE0) || 
+                        (uint8[i] === 0x66 && uint8[i+1] === 0x4C && uint8[i+2] === 0x61 && uint8[i+3] === 0x43)) {
+                        try { return await ctx.decodeAudioData(rawBuffer.slice(i)); } catch(inner) {}
+                    }
+                }
+                throw new Error("音频解析失败");
+            }
+        }
+
+        // 下载排队逻辑（已允许弹窗后可缩短时间）
+        async function processDownloadQueue() {
+            if (downloadQueue.length === 0) return;
+            
+            const { blob, filename } = downloadQueue.shift();
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            setTimeout(() => URL.revokeObjectURL(url), 20000);
+
+            if (downloadQueue.length > 0) {
+                setTimeout(processDownloadQueue, 800); // 缩短至 0.8s，体感更流畅
+            }
+        }
+
+        async function triggerZipDownload() {
+            if (currentChunkFiles.length === 0) return;
+            
+            const zip = new JSZip();
+            const currentPart = partCounter++;
+            const filename = `NCM_WAV_Part_${currentPart}.zip`;
+            
+            currentChunkFiles.forEach(f => zip.file(f.name, f.blob));
+            // 存储级别压缩（STORE）以提高大文件打包速度并降低内存占用
+            const zipBlob = await zip.generateAsync({ type: "blob", compression: "STORE" });
+            
+            downloadQueue.push({ blob: zipBlob, filename });
+            if (downloadQueue.length === 1) {
+                processDownloadQueue();
+            }
+            
+            // 在顶部增加手动点击区域
+            const btn = document.createElement('button');
+            btn.className = "text-xs bg-slate-100 text-slate-700 px-3 py-1 rounded hover:bg-indigo-100 hover:text-indigo-700 transition border border-slate-200";
+            btn.textContent = `💾 Part ${currentPart}`;
+            btn.title = "点击手动下载此分卷";
+            btn.onclick = () => {
+                const url = URL.createObjectURL(zipBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 5000);
+            };
+            globalActions.prepend(btn);
+
+            currentChunkFiles = []; 
+        }
+
+        async function processQueue() {
+            if (isProcessing || fileQueue.length === 0) return;
+            isProcessing = true;
+            
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+            while (fileQueue.length > 0) {
+                const { file, id } = fileQueue.shift();
+                
+                try {
+                    updateStatus(id, '读取中...', 'text-blue-500');
+                    let raw = await file.arrayBuffer();
+                    let decrypted = await decryptNcm(raw);
+                    raw = null;
+
+                    updateStatus(id, '转换中...', 'text-orange-500');
+                    let audioBuffer = await robustDecodeAudio(audioCtx, decrypted);
+                    decrypted = null;
+
+                    let wavArr = audioBufferToWav(audioBuffer);
+                    audioBuffer = null;
+
+                    const wavBlob = new Blob([wavArr], { type: 'audio/wav' });
+                    const newName = file.name.replace(/\.ncm$/i, '.wav');
+
+                    currentChunkFiles.push({ blob: wavBlob, name: newName });
+                    finishedCount++;
+                    
+                    completeTask(id);
+
+                    if (currentChunkFiles.length === CHUNK_SIZE) {
+                        updateStatus(id, '正在打包分卷...', 'text-purple-600 font-bold');
+                        await triggerZipDownload();
+                    }
+                } catch (err) {
+                    updateStatus(id, '失败: ' + err.message, 'text-red-500');
+                }
+                updateProgress();
+            }
+            
+            if (currentChunkFiles.length > 0) {
+                await triggerZipDownload();
+            }
+
+            isProcessing = false;
+        }
+
+        function addToList(id, name) {
+            taskList.classList.remove('hidden');
+            itemsContainer.insertAdjacentHTML('afterbegin', `
+                <div id="${id}" class="bg-white p-3 rounded-lg shadow-sm border border-slate-200 flex items-center justify-between transition-all">
+                    <div class="flex-1 truncate pr-4">
+                        <div class="text-sm font-medium text-slate-700 truncate">${name}</div>
+                        <div class="status text-[10px] text-slate-400">队列中</div>
+                    </div>
+                    <div class="action-area"><div class="w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div></div>
+                </div>
+            `);
+        }
+
+        function updateStatus(id, text, colorClass) {
+            const el = document.getElementById(id);
+            if (el) {
+                const s = el.querySelector('.status');
+                s.textContent = text;
+                s.className = `status text-[10px] ${colorClass}`;
+            }
+        }
+
+        function completeTask(id) {
+            const el = document.getElementById(id);
+            if (el) {
+                updateStatus(id, '已就绪', 'text-green-600');
+                el.querySelector('.action-area').innerHTML = `
+                    <svg class="w-4 h-4 text-green-500" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
+                    </svg>
+                `;
+            }
+        }
+
+        function updateProgress() {
+            progressCount.textContent = `已处理: ${finishedCount} / ${totalFiles}`;
+        }
+
+        async function handleFiles(files) {
+            const ncmFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.ncm'));
+            if (!ncmFiles.length) return;
+            totalFiles += ncmFiles.length;
+            ncmFiles.forEach(file => {
+                const id = Math.random().toString(36).substr(2, 9);
+                addToList(id, file.name);
+                fileQueue.push({ file, id });
+            });
+            if (!isProcessing) processQueue();
+        }
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', e => handleFiles(e.target.files));
+        clearBtn.addEventListener('click', () => {
+            itemsContainer.innerHTML = '';
+            fileQueue = [];
+            currentChunkFiles = [];
+            downloadQueue = [];
+            totalFiles = 0; finishedCount = 0; partCounter = 1;
+            taskList.classList.add('hidden');
+            const btns = globalActions.querySelectorAll('button:not(#clearBtn)');
+            btns.forEach(b => b.remove());
+        });
+        
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragging'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragging'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault(); dropZone.classList.remove('dragging');
+            handleFiles(e.dataTransfer.files);
+        });
+    </script>
+</body>
+</html>
