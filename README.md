@@ -1,14 +1,16 @@
 # NCM to WAV
 
+🌐 **Language:** English | [中文](README.zh-CN.md)
+
 A browser-based batch converter for `.ncm` audio files. The tool reads local NCM files, decrypts the embedded audio stream in the browser, decodes it with the Web Audio API, wraps the result as WAV, and downloads converted files in ZIP batches.
 
 All processing happens locally in the browser. Files are not uploaded to a server.
 
-## Live Demo
+## 🚀 Live Demo
 
 https://ybjdebao.github.io/NCM-to-WAV/
 
-## Features
+## ✨ Features
 
 - Drag-and-drop interface for selecting multiple `.ncm` files.
 - Batch conversion from NCM to WAV.
@@ -19,7 +21,7 @@ https://ybjdebao.github.io/NCM-to-WAV/
 - Manual download buttons for generated ZIP parts.
 - Progress list with per-file status updates.
 
-## How to Use
+## 📦 How to Use
 
 1. Open the live demo.
 2. Allow pop-ups/downloads for the site if your browser asks.
@@ -28,7 +30,7 @@ https://ybjdebao.github.io/NCM-to-WAV/
 5. Download each generated ZIP part.
 6. Extract the ZIP files to access the converted `.wav` files.
 
-## Local Development
+## 🛠️ Local Development
 
 This is a static web page. No build tool is required.
 
@@ -42,7 +44,7 @@ Then open:
 http://localhost:8000
 ```
 
-## Project Structure
+## 📁 Project Structure
 
 ```text
 .
@@ -50,10 +52,11 @@ http://localhost:8000
 │   └── workflows/
 │       └── static.yml
 ├── index.html
-└── README.md
+├── README.md
+└── README.zh-CN.md
 ```
 
-## Technical Overview
+## 🧩 Technical Overview
 
 The converter is built with:
 
@@ -63,14 +66,13 @@ The converter is built with:
 - JSZip for packaging converted files into downloadable ZIP archives.
 - Tailwind CSS loaded from a CDN for the interface.
 
-## Limitations
+## ⚠️ Limitations
 
 - Browser memory limits apply, especially for large batches or long audio files.
 - Conversion success depends on whether the browser can decode the decrypted audio stream.
 - Some browsers may block repeated automatic downloads unless pop-ups or downloads are allowed for the site.
 - The output is WAV, which is typically much larger than compressed audio formats.
 
-## Legal Notice
+## 📜 Legal Notice
 
 Use this tool only with audio files that you own or are otherwise authorized to convert. Respect copyright, licensing terms, and platform rules for any media you process.
-
